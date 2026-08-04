@@ -1,0 +1,12 @@
+[Unit]
+Description=WFAS native UDP unicast audio receiver
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/wfas-client-native/wfas_native_client.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
