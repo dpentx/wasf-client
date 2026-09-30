@@ -1,0 +1,191 @@
+#!/bin/bash
+# WFAS client AppImage giriş noktası.
+#
+#   ./WFAS-Client-x86_64.AppImage [istemci argümanları]   -> istemciyi çalıştırır
+#   ... --tui                        -> durum ekranı (TUI), çalışan istemciye bağlanır
+#   ... --launch                     -> istemciyi arka planda başlatır + TUI'yi açar
+#   ... --install-service [args]     -> systemd --user servisi kurar ve başlatır
+#   ... --install-autostart [args]   -> systemd yoksa: Fluxbox açılışına ekler
+#   ... --uninstall                  -> servisi ve autostart'ı kaldırır
+set -u
+
+HERE="$(dirname "$(readlink -f "$0")")"
+export APPDIR="${APPDIR:-$HERE}"
+PY="$APPDIR/opt/python3.11/bin/python3.11"
+APP="$APPDIR/opt/wfas"
+
+unset PYTHONHOME PYTHONPATH
+export PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE=1
+export SSL_CERT_FILE="$APPDIR/opt/_internal/certs.pem"
+
+BIN_DIR="$HOME/.local/bin"
+INSTALLED="$BIN_DIR/wfas-client.AppImage"
+LAUNCHER="$BIN_DIR/wfas-client-launch.sh"
+UNIT_DIR="$HOME/.config/systemd/user"
+UNIT="$UNIT_DIR/wfas-native-client.service"
+FLUX_STARTUP="$HOME/.fluxbox/startup"
+MARK_BEGIN="# >>> wfas-native-client appimage autostart >>>"
+MARK_END="# <<< wfas-native-client appimage autostart <<<"
+
+die() { echo "HATA: $*" >&2; exit 1; }
+
+have_fuse() {
+    [ -e /dev/fuse ] && ldconfig -p 2>/dev/null | grep -q 'libfuse\.so\.2'
+}
+
+# Servis/autostart, AppImage'ın kendisine işaret eder; kullanıcı dosyayı
+# taşıyıp silse bile kırılmasın diye sabit bir yere kopyalanır.
+install_self() {
+    [ -n "${APPIMAGE:-}" ] || die "Bu komut sadece .AppImage dosyasının kendisinden çalıştırılabilir (APPIMAGE tanımlı değil)."
+    mkdir -p "$BIN_DIR"
+    if [ "$(readlink -f "$APPIMAGE")" != "$(readlink -f "$INSTALLED")" ]; then
+        cp -f "$APPIMAGE" "$INSTALLED.new" && mv -f "$INSTALLED.new" "$INSTALLED"
+    fi
+    chmod +x "$INSTALLED"
+    echo "-> AppImage kopyalandı: $INSTALLED"
+}
+
+# systemd ExecStart için argüman kaçışı (\, ", % karakterleri)
+sd_quote() {
+    local out="" a
+    for a in "$@"; do
+        a=${a//\\/\\\\}; a=${a//\"/\\\"}; a=${a//%/%%}
+        out+=" \"$a\""
+    done
+    printf '%s' "$out"
+}
+
+# sh için tek tırnak kaçışı
+sh_quote() {
+    local out="" a
+    for a in "$@"; do
+        out+=" '${a//\'/\'\\\'\'}'"
+    done
+    printf '%s' "$out"
+}
+
+systemd_user_ok() {
+    command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+}
+
+cmd_install_service() {
+    install_self
+    systemd_user_ok || die "systemd --user bu oturumda çalışmıyor. Bunun yerine: $INSTALLED --install-autostart"
+    mkdir -p "$UNIT_DIR"
+    local envline=""
+    have_fuse || envline="Environment=APPIMAGE_EXTRACT_AND_RUN=1"
+    cat > "$UNIT" <<UNITEOF
+[Unit]
+Description=WFAS native UDP unicast audio receiver (AppImage)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+ExecStart="$INSTALLED"$(sd_quote "$@")
+$envline
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+UNITEOF
+    systemctl --user daemon-reload
+    loginctl enable-linger "$USER" 2>/dev/null || true
+    systemctl --user enable --now wfas-native-client.service
+    echo "-> Servis kuruldu ve başlatıldı: $UNIT"
+    echo "   Log:   journalctl --user -u wfas-native-client -f"
+    echo "   Durum: $INSTALLED --tui      (ya da http://localhost:8091)"
+}
+
+cmd_install_autostart() {
+    install_self
+    mkdir -p "$(dirname "$FLUX_STARTUP")"
+    if [ ! -f "$FLUX_STARTUP" ]; then
+        printf '#!/bin/sh\n\nexec fluxbox\n' > "$FLUX_STARTUP"
+        chmod +x "$FLUX_STARTUP"
+    fi
+    if grep -qF "$MARK_BEGIN" "$FLUX_STARTUP"; then
+        echo "-> Fluxbox startup zaten yapılandırılmış, dokunulmadı (önce --uninstall ile kaldırabilirsin)."
+        return
+    fi
+    # Terminale iç içe tırnak vermemek için başlatıcı ayrı bir dosyada durur.
+    local pre=""
+    have_fuse || pre="APPIMAGE_EXTRACT_AND_RUN=1 "
+    cat > "$LAUNCHER" <<LAUNCHEOF
+#!/bin/sh
+exec env ${pre}'$INSTALLED' --launch$(sh_quote "$@")
+LAUNCHEOF
+    chmod +x "$LAUNCHER"
+
+    local block tmp
+    block="$MARK_BEGIN
+for t in xfce4-terminal urxvt lxterminal xterm; do
+    if command -v \$t >/dev/null 2>&1; then
+        case \$t in
+            xfce4-terminal) \$t --title=\"WFAS Durumu\" --geometry=60x14 -e \"$LAUNCHER\" & ;;
+            lxterminal)     \$t --title=\"WFAS Durumu\" -e \"$LAUNCHER\" & ;;
+            *)              \$t -T \"WFAS Durumu\" -geometry 60x14 -e \"$LAUNCHER\" & ;;
+        esac
+        break
+    fi
+done
+$MARK_END"
+    cp "$FLUX_STARTUP" "$FLUX_STARTUP.bak.$(date +%s)"
+    tmp="$(mktemp)"
+    # ENVIRON kullanılır: awk -v ters bölüleri (\\) yorumlayıp bloğu bozar.
+    WFAS_BLOCK="$block" awk '
+        /^[[:space:]]*exec[[:space:]]+fluxbox/ && !done { print ENVIRON["WFAS_BLOCK"]; done = 1 }
+        { print }
+        END { if (!done) print ENVIRON["WFAS_BLOCK"] }
+    ' "$FLUX_STARTUP" > "$tmp"
+    mv "$tmp" "$FLUX_STARTUP"
+    chmod +x "$FLUX_STARTUP"
+    echo "-> Fluxbox startup güncellendi. Oturumu yeniden başlatınca durum penceresi açılır."
+    echo "   Bu pencere kapanırsa istemci de durur (systemd yok, istemci pencerenin içinde çalışır)."
+}
+
+cmd_uninstall() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user disable --now wfas-native-client.service 2>/dev/null || true
+    fi
+    rm -f "$UNIT" "$LAUNCHER"
+    command -v systemctl >/dev/null 2>&1 && systemctl --user daemon-reload 2>/dev/null || true
+    if [ -f "$FLUX_STARTUP" ] && grep -qF "$MARK_BEGIN" "$FLUX_STARTUP"; then
+        local tmp; tmp="$(mktemp)"
+        awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+            $0 == b { skip = 1; next }
+            $0 == e { skip = 0; next }
+            !skip { print }
+        ' "$FLUX_STARTUP" > "$tmp"
+        mv "$tmp" "$FLUX_STARTUP"; chmod +x "$FLUX_STARTUP"
+    fi
+    echo "-> Servis ve autostart kaldırıldı. Kopya dosya duruyor: $INSTALLED (istersen sil)."
+}
+
+# İstemci arka planda, TUI önde. TUI kapanınca istemci de durur: AppImage'ın
+# bağlı olduğu dosya sistemi, çalışan bir süreç varken sağlıklı kaldırılamaz.
+cmd_launch() {
+    "$PY" "$APP/wfas_native_client.py" "$@" >>"$HOME/.cache/wfas-native-client.log" 2>&1 &
+    local cpid=$!
+    trap 'kill "$cpid" 2>/dev/null' EXIT INT TERM
+    sleep 1
+    "$PY" "$APP/wfas_tui.py"
+}
+
+mkdir -p "$HOME/.cache" 2>/dev/null
+
+case "${1:-}" in
+    --tui)               shift; exec "$PY" "$APP/wfas_tui.py" "$@" ;;
+    --launch)            shift; cmd_launch "$@" ;;
+    --install-service)   shift; cmd_install_service "$@" ;;
+    --install-autostart) shift; cmd_install_autostart "$@" ;;
+    --uninstall)         cmd_uninstall ;;
+    -h|--help)
+        sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+        echo
+        echo "--- istemci seçenekleri ---"
+        exec "$PY" "$APP/wfas_native_client.py" --help
+        ;;
+    *) exec "$PY" "$APP/wfas_native_client.py" "$@" ;;
+esac

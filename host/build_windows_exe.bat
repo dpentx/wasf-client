@@ -4,15 +4,15 @@ echo == WFAS Host - tasinabilir exe derleniyor ==
 echo.
 
 python -m pip install --upgrade pip
-python -m pip install pyinstaller pyaudiowpatch pystray pillow
+python -m pip install -r requirements-windows.txt
 
 echo.
 echo -- konsolsuz (tray-only) surum --
-python -m PyInstaller --onefile --windowed --name wfas_host wfas_host.py
+python -m PyInstaller --onefile --windowed --name wfas_host --collect-data sv_ttk --hidden-import pystray._win32 wfas_host.py
 
 echo.
 echo -- konsollu (debug) surum --
-python -m PyInstaller --onefile --console --name wfas_host_debug wfas_host.py
+python -m PyInstaller --onefile --console --name wfas_host_debug --collect-data sv_ttk --hidden-import pystray._win32 wfas_host.py
 
 echo.
 echo Bitti!
@@ -22,6 +22,11 @@ echo.
 echo Ikisini de USB'ye kopyalayip okul bilgisayarinda calistirabilirsin.
 echo   wfas_host.exe --key gizliAnahtar
 echo.
-echo Log dosyasi (windowed surumde bile tutulur): %%USERPROFILE%%\wfas_host.log
+echo Host'un kendi hoparlorunden ses cikmasin istersen: Ayarlar ^> Sistem ^> Ses'ten
+echo kullanilmayan bir cikisi (or. bos kulaklik jack'i) elle varsayilan yap.
+echo.
+echo Log dosyasi (windowed surumde bile tutulur): %USERPROFILE%\wfas_host.log
+echo.
+echo Not: GitHub Actions da ayni exe'leri otomatik derler (Actions ^> Build host).
 echo.
 pause

@@ -1,0 +1,9 @@
+# build_windows_exe.bat ve .github/workflows/build-host.yml bunu kullanır.
+# Sürümleri burada sabitleyip güncellersen ikisi de otomatik senkron kalır.
+pyinstaller==6.11.1
+pyaudiowpatch==0.2.12.7
+pystray==0.19.5
+pillow==11.1.0
+# Opsiyonel - kurulu değilse kaydırıcı penceresi varsayılan ttk temasıyla
+# açılır, hataya düşmez. Kuruluysa Windows 11 Fluent/WinUI3'e yakın görünüm.
+sv-ttk==2.6.0
