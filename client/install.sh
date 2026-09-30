@@ -11,6 +11,15 @@ else
     echo "-> aplay zaten kurulu."
 fi
 
+if command -v pactl >/dev/null 2>&1; then
+    echo "-> pactl bulundu, ses seviyesi kontrolü PulseAudio/PipeWire üzerinden çalışacak."
+elif command -v amixer >/dev/null 2>&1; then
+    echo "-> pactl yok ama amixer var, ses seviyesi kontrolü ALSA üzerinden çalışacak."
+else
+    echo "-> UYARI: ne pactl ne amixer bulunamadı, ses seviyesi kontrolü çalışmayacak."
+    echo "   (alsa-utils zaten kuruldu, amixer onunla gelmeliydi - kontrol et: which amixer)"
+fi
+
 INSTALL_DIR="$HOME/wfas-client-native"
 mkdir -p "$INSTALL_DIR"
 SRC_DIR="$(dirname "$0")"
