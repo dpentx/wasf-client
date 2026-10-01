@@ -1,0 +1,50 @@
+name: Build client (AppImage)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "client/**"
+      - ".github/workflows/build-client-appimage.yml"
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # tag push'ta release'e dosya yüklemek için
+
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x client/appimage/build-appimage.sh client/appimage/AppRun
+          client/appimage/build-appimage.sh
+
+      - name: Duman testi
+        run: |
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          f=client/appimage/dist/WFAS-Client-x86_64.AppImage
+          "$f" --help >/tmp/help.txt 2>&1
+          head -20 /tmp/help.txt
+          "$f" --web-port 18091 --no-wifi-autoconnect >/tmp/run.log 2>&1 &
+          pid=$!
+          sleep 6
+          curl -fsS localhost:18091/status.json
+          kill "$pid" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WFAS-Client-x86_64.AppImage
+          path: client/appimage/dist/WFAS-Client-x86_64.AppImage
+          if-no-files-found: error
+
+      - name: Release'e ekle (sadece v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: client/appimage/dist/WFAS-Client-x86_64.AppImage
