@@ -34,7 +34,9 @@ import hashlib
 import hmac
 import json
 import queue
+import re
 import secrets
+import shutil
 import socket
 import struct
 import subprocess
@@ -48,6 +50,28 @@ DISCOVERY_PREFIX = "WIFI_AUDIO_STREAMER_DISCOVERY"
 PROTOCOL_VERSION = 2
 FRESH_WINDOW = 30
 PING_TIMEOUT = 3.0
+MIN_PREBUFFER_MS = 20
+MAX_PREBUFFER_MS = 1000
+
+# AudioWriter, YENİ BİR OTURUM başlarken (bağlantı koptuğunda/tekrar
+# bağlanıldığında) bu değeri okur. Yani host'tan gelen bir değişiklik o an
+# akan sese anında değil, bir sonraki oturuma yansır - ses akışını
+# ortasından kesip yeniden buffer'lamak zaten kendi başına küçük bir
+# kesinti/gecikme yaratacağı için bu, akışı bozmadan en makul davranış.
+prebuffer_lock = threading.Lock()
+current_prebuffer_ms = 120
+
+def get_prebuffer_ms():
+    with prebuffer_lock:
+        return current_prebuffer_ms
+
+def set_prebuffer_ms(ms):
+    global current_prebuffer_ms
+    ms = max(MIN_PREBUFFER_MS, min(MAX_PREBUFFER_MS, int(ms)))
+    with prebuffer_lock:
+        current_prebuffer_ms = ms
+    set_state(prebuffer_ms=ms)
+    return ms
 
 state_lock = threading.Lock()
 state = {
@@ -56,6 +80,8 @@ state = {
     "sr": None, "ch": None,
     "packets": 0, "silence_inserted": 0,
     "last_error": None,
+    "volume": None, "volume_backend": None,
+    "prebuffer_ms": current_prebuffer_ms,
     "updated": time.time(),
 }
 
@@ -67,6 +93,103 @@ def set_state(**kwargs):
 def get_state():
     with state_lock:
         return dict(state)
+
+class SystemVolume:
+    """Client makinenin KENDİ ses seviyesini (host'un gönderdiği veriye
+    uyguladığı yazılımsal kazanç DEĞİL - donanım/OS seviyesindeki gerçek
+    çıkış seviyesi) okur/yazar. Bunun host tarafındaki gain'den farkı: host
+    gain'i sadece 0-100 arası AŞAĞI kısar (kaynağı çarpıp gönderiyor),
+    client'ın kendi ses seviyesi ise gerçek tavanı belirler - client'ın
+    sistem sesi düşükse host tray'i %100'e alsan bile ses kısık kalır.
+    İkisi birlikte kullanılır: client sesi (bu sınıf) tabanı/tavanı
+    ayarlar, host'taki gain ince ayar/hızlı kısma için kalır.
+
+    MX Linux/Fluxbox + systemd ortamında iki olası backend var, hangisi
+    kuruluysa (PulseAudio/PipeWire varsa pactl, yoksa çıplak ALSA) onu
+    kullanır - ikisi de yoksa sessizce None döner, hataya düşürmez."""
+
+    def __init__(self):
+        self._backend = None
+        if shutil.which("pactl"):
+            self._backend = "pactl"
+        elif shutil.which("amixer"):
+            self._backend = "amixer"
+        if self._backend is None:
+            print("[ses] pactl da amixer de bulunamadı - client'ın kendi ses "
+                  "seviyesi okunamıyor/değiştirilemiyor. PulseAudio/PipeWire "
+                  "içinse 'pactl' (pulseaudio-utils paketi), çıplak ALSA "
+                  "içinse 'amixer' (alsa-utils paketi) kurulu olmalı.")
+
+    @property
+    def backend(self):
+        return self._backend
+
+    def get(self):
+        """0-100 arası tam sayı döner, okunamazsa None."""
+        if self._backend == "pactl":
+            try:
+                out = subprocess.check_output(
+                    ["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
+                    text=True, timeout=3,
+                )
+                m = re.search(r"(\d+)%", out)
+                return int(m.group(1)) if m else None
+            except Exception:
+                return None
+        if self._backend == "amixer":
+            try:
+                out = subprocess.check_output(
+                    ["amixer", "get", "Master"], text=True, timeout=3,
+                )
+                m = re.search(r"\[(\d+)%\]", out)
+                return int(m.group(1)) if m else None
+            except Exception:
+                return None
+        return None
+
+    def set(self, pct):
+        """0-100 arası hedef seviye. Başarılıysa True döner. 0'a çekerken
+        mute de uygular (bazı donanımlarda %0 ile mute farklı davranabiliyor
+        - ikisini birden yapmak sağlamlaştırıyor), 0 üzerine çıkınca unmute
+        eder."""
+        pct = max(0, min(100, int(round(pct))))
+        if self._backend == "pactl":
+            try:
+                subprocess.run(
+                    ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"],
+                    timeout=3, check=True,
+                )
+                subprocess.run(
+                    ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1" if pct == 0 else "0"],
+                    timeout=3,
+                )
+                return True
+            except Exception as e:
+                print(f"[ses] pactl ile seviye ayarlanamadı: {e}")
+                return False
+        if self._backend == "amixer":
+            try:
+                subprocess.run(
+                    ["amixer", "-q", "set", "Master", f"{pct}%",
+                     "mute" if pct == 0 else "unmute"],
+                    timeout=3, check=True,
+                )
+                return True
+            except Exception as e:
+                print(f"[ses] amixer ile seviye ayarlanamadı: {e}")
+                return False
+        return False
+
+system_volume = SystemVolume()
+
+def volume_poll_loop(interval=3.0):
+    """Arka planda periyodik olarak gerçek sistem sesini okuyup state'e
+    yazar - biri terminalden/masaüstünden elle değiştirse bile web
+    arayüzü/host güncel değeri görür."""
+    while True:
+        set_state(volume=system_volume.get(), volume_backend=system_volume.backend)
+        time.sleep(interval)
+
 
 class Discovery:
     """WFAS UDP multicast beacon'ını sürekli dinler; en güncel sunucu
@@ -162,6 +285,35 @@ def parse_kv(msg, key):
 
 def hmac_hex(key: bytes, msg: str) -> str:
     return hmac.new(key, msg.encode("ascii"), hashlib.sha256).hexdigest()
+
+CONTROL_AUTH_WINDOW = 30  # saniye - bu pencerenin dışındaki imzalar reddedilir (replay koruması)
+control_key = None  # main()'de --key'den set edilir (bytes ya da None)
+
+def verify_control_auth(headers, raw_body: bytes) -> bool:
+    """/volume, /latency, /connect için basit paylaşılan-anahtar imza
+    kontrolü - ses akışındaki --key ile AYNI anahtarı kullanır (kasıtlı,
+    ayrı bir anahtar yönetmek gereksiz karmaşıklık olurdu). --key
+    verilmediyse (Open mode) kontrol endpoint'leri de açık kalır - ses
+    protokolüyle tutarlı davranış, sürpriz olmasın diye.
+    İmza: HMAC-SHA256(key, f"{ts}:{body}") - X-WFAS-Ts / X-WFAS-Auth
+    header'larında gelir. ts, host'un sistem saatiyle ±30 sn içinde
+    olmalı (replay koruması); host ile client'ın saatleri epey
+    uyumsuzsa bu payı gerekirse büyütürüz."""
+    if control_key is None:
+        return True
+    ts = headers.get("X-WFAS-Ts")
+    sig = headers.get("X-WFAS-Auth")
+    if not ts or not sig:
+        return False
+    try:
+        ts_val = int(ts)
+    except ValueError:
+        return False
+    if abs(time.time() - ts_val) > CONTROL_AUTH_WINDOW:
+        return False
+    expected = hmac_hex(control_key, f"{ts}:{raw_body.decode('utf-8', 'replace')}")
+    return hmac.compare_digest(sig, expected)
+
 
 class WifiAutoConnector(threading.Thread):
     """Host taşınabilir olduğu ve her seferinde farklı bir laptop olabildiği
@@ -426,12 +578,14 @@ class AudioWriter:
     sapmaları sesi kesmez."""
 
     def __init__(self, player, sample_rate, channels, bit_depth=16,
-                 prebuffer_ms=120, max_queue_ms=1500):
+                 prebuffer_ms=None, max_queue_ms=1500):
         self.player = player
         self.frame_size = channels * (bit_depth // 8)
-        bytes_per_ms = sample_rate * self.frame_size // 1000
-        self.prebuffer_bytes = bytes_per_ms * prebuffer_ms
-        self.max_queue_bytes = bytes_per_ms * max_queue_ms
+        self.bytes_per_ms = sample_rate * self.frame_size // 1000
+        if prebuffer_ms is None:
+            prebuffer_ms = get_prebuffer_ms()  # o anki güncel gecikme ayarı
+        self.prebuffer_bytes = self.bytes_per_ms * prebuffer_ms
+        self.max_queue_bytes = self.bytes_per_ms * max_queue_ms
         self.q = queue.Queue()
         self.q_bytes = 0
         self.q_lock = threading.Lock()
@@ -487,6 +641,7 @@ body{font-family:sans-serif;background:#111;color:#eee;padding:24px}
 .ok{color:#22c55e}.bad{color:#ef4444}.warn{color:#eab308}
 input{background:#111;color:#eee;border:1px solid #444;border-radius:6px;padding:6px;margin-right:6px}
 button{background:#BB86FC;border:none;border-radius:6px;padding:6px 12px;cursor:pointer}
+input[type=range]{width:100%}
 </style></head><body>
 <div class="card">
 <h2>WFAS Native UDP Client</h2>
@@ -497,10 +652,17 @@ button{background:#BB86FC;border:none;border-radius:6px;padding:6px 12px;cursor:
 <div class="row"><span>Sessizlikle doldurulan örnek</span><span id="sil">-</span></div>
 <div class="row"><span>Son hata</span><span id="err">-</span></div>
 <hr>
+<div class="row"><span>Client ses seviyesi (<span id="vbackend">-</span>)</span><span id="vpct">-</span></div>
+<input type="range" id="vol" min="0" max="100" value="0" oninput="onSlide(this.value)" onchange="setVolume(this.value)">
+<div class="row" style="margin-top:10px"><span>Gecikme / jitter buffer</span><span id="lms">-</span></div>
+<input type="range" id="lat" min="20" max="500" step="10" value="120" oninput="onLatSlide(this.value)" onchange="setLatency(this.value)">
+<hr>
 <div><input id="h" placeholder="IP"><input id="p" placeholder="Port" size="4">
 <button onclick="connect()">Bağlan</button></div>
 </div>
 <script>
+let dragging = false;
+let latDragging = false;
 async function tick(){
   try{
     const r = await fetch('/status.json'); const j = await r.json();
@@ -512,7 +674,36 @@ async function tick(){
     document.getElementById('pkts').textContent = j.packets;
     document.getElementById('sil').textContent = j.silence_inserted;
     document.getElementById('err').textContent = j.last_error || '-';
+    document.getElementById('vbackend').textContent = j.volume_backend || 'yok';
+    if(!dragging && j.volume !== null && j.volume !== undefined){
+      document.getElementById('vol').value = j.volume;
+      document.getElementById('vpct').textContent = '%' + j.volume;
+    }
+    if(!latDragging && j.prebuffer_ms !== null && j.prebuffer_ms !== undefined){
+      document.getElementById('lat').value = j.prebuffer_ms;
+      document.getElementById('lms').textContent = j.prebuffer_ms + ' ms';
+    }
   }catch(e){}
+}
+function onSlide(v){
+  dragging = true;
+  document.getElementById('vpct').textContent = '%' + v;
+}
+async function setVolume(v){
+  const r = await fetch('/volume', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({value: parseInt(v)})});
+  if(r.status === 401){ alert('Yetkisiz: Key mode açık, web arayüzünden imzasız kontrol edilemez. Host tray\'ini ya da imzalı bir istemciyi kullan.'); }
+  dragging = false;
+}
+function onLatSlide(v){
+  latDragging = true;
+  document.getElementById('lms').textContent = v + ' ms';
+}
+async function setLatency(v){
+  const r = await fetch('/latency', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({value: parseInt(v)})});
+  if(r.status === 401){ alert('Yetkisiz: Key mode açık, web arayüzünden imzasız kontrol edilemez. Host tray\'ini ya da imzalı bir istemciyi kullan.'); }
+  latDragging = false;
 }
 async function connect(){
   const host=document.getElementById('h').value, port=document.getElementById('p').value;
@@ -550,10 +741,23 @@ class StatusHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(length) if length else b""
+
+        if self.path in ("/connect", "/volume", "/latency"):
+            if not verify_control_auth(self.headers, raw_body):
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                body = json.dumps({"error": "yetkisiz - imza/zaman damgası "
+                                             "geçersiz ya da eksik"}).encode("utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
         if self.path == "/connect":
-            length = int(self.headers.get("Content-Length", 0))
             try:
-                payload = json.loads(self.rfile.read(length) or b"{}")
+                payload = json.loads(raw_body or b"{}")
                 with override_lock:
                     manual_override["host"] = payload.get("host") or None
                     manual_override["port"] = int(payload.get("port") or 0) or None
@@ -562,6 +766,47 @@ class StatusHandler(BaseHTTPRequestHandler):
             except Exception:
                 self.send_response(400)
                 self.end_headers()
+        elif self.path == "/volume":
+            try:
+                payload = json.loads(raw_body or b"{}")
+                pct = int(payload.get("value"))
+            except Exception:
+                self.send_response(400)
+                self.end_headers()
+                return
+            if system_volume.backend is None:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                body = json.dumps({"error": "pactl/amixer bulunamadı"}).encode("utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            ok = system_volume.set(pct)
+            set_state(volume=system_volume.get(), volume_backend=system_volume.backend)
+            self.send_response(200 if ok else 500)
+            self.send_header("Content-Type", "application/json")
+            body = json.dumps({"ok": ok, "volume": get_state()["volume"]}).encode("utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/latency":
+            try:
+                payload = json.loads(raw_body or b"{}")
+                ms = int(payload.get("value"))
+            except Exception:
+                self.send_response(400)
+                self.end_headers()
+                return
+            applied = set_prebuffer_ms(ms)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            body = json.dumps({"ok": True, "prebuffer_ms": applied,
+                                "note": "sonraki oturumda (bağlantı kopup "
+                                        "tekrar kurulunca) uygulanır"}).encode("utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
@@ -576,8 +821,17 @@ def main():
     ap = argparse.ArgumentParser(description="WFAS native UDP unicast client")
     ap.add_argument("--host", help="Sunucu IP (verilirse keşif yerine sabit hedef)")
     ap.add_argument("--port", type=int, help="Sunucunun WFAS streaming portu (--host ile birlikte)")
-    ap.add_argument("--key", help="Key mode güvenlik anahtarı (sunucuda 'Key' modu açıksa)")
+    ap.add_argument("--key", help="Key mode güvenlik anahtarı (sunucuda 'Key' modu açıksa). "
+                                   "Aynı anahtar /volume ve /latency uzaktan kontrol "
+                                   "endpoint'lerini de korur - verilmezse (Open mode) o "
+                                   "endpoint'ler de kimlik doğrulamasız kalır.")
     ap.add_argument("--web-port", type=int, default=8091, help="Durum arayüzü portu (varsayılan 8091)")
+    ap.add_argument("--prebuffer-ms", type=int, default=120,
+                     help="Çalmaya başlamadan önce biriktirilen jitter buffer / gecikme süresi, "
+                          "ms (varsayılan 120). Büyütürsen ağ sapmalarına karşı daha dayanıklı "
+                          "olur ama host'ta bir medyayı durdurunca client'ta hissedilen gecikme "
+                          "artar; küçültürsen tam tersi. Host tray'inden de uzaktan (yeni "
+                          "bağlantıya uygulanır) değiştirilebilir.")
     ap.add_argument("--interval", type=int, default=10, help="Keşif/sağlık kontrol aralığı, sn")
     ap.add_argument("--wifi-ssid", default="wfas wifi",
                      help="Host'un Mobil Hotspot SSID'si - görülünce otomatik bağlanılır (varsayılan: 'wfas wifi')")
@@ -587,7 +841,13 @@ def main():
                      help="Otomatik WiFi bağlanmayı kapat (mevcut ağı elle yönetmek istiyorsan)")
     args = ap.parse_args()
 
+    global control_key
+    control_key = args.key.encode("utf-8") if args.key else None
+
     start_status_server(args.web_port)
+    set_prebuffer_ms(args.prebuffer_ms)
+    set_state(volume=system_volume.get(), volume_backend=system_volume.backend)
+    threading.Thread(target=volume_poll_loop, daemon=True).start()
 
     wifi_connector = None
     if not args.no_wifi_autoconnect:
