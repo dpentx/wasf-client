@@ -45,7 +45,7 @@ Client farklı bir `--web-port` ile çalıştırıldıysa host'u da
 `--client-web-port <port>` ile aynı porta işaret et (varsayılan: 8091,
 ikisi de).
 
-`--key` verilmişse (Key mode), host bu iki uzaktan-kontrol isteini de
+`--key` verilmişse (Key mode), host bu iki uzaktan-kontrol isteğini de
 aynı anahtarla otomatik imzalıyor (client'ta `--key` AYNI olmalı) -
 ayrıca bir şey yapmana gerek yok. Anahtarlar uyuşmuyorsa tray log'una
 "yetkisiz" uyarısı düşer.
@@ -119,7 +119,7 @@ yerden duyulabilir ses çıkmıyor — jack'in ucu boşta.
 gerçek bir kazanç/gain kontrolü uygulamadığını doğruluyor — "CABLE
 Input" için gösterilen ses kaydırıcısı sadece görsel, sesin seviyesine
 hiçbir etkisi yok (sabit/unity gain). Yani VB-CABLE ile host'u
-susturabilirsin ama Windows ses panelinden client'a giden sesi kıp
+susturabilirsin ama Windows ses panelinden client'a giden sesi kısıp
 açamazsın — tam da bizim ihtiyacımızın tersi. Ayrıca kurulumu (installer
 sarmalayıcısı sessiz kurulum parametrelerini iç setup'a forward etmiyor,
 bazı sistemlerde restart gerekiyor) bu projenin "kurulumsuz, aç-kullan"
@@ -161,7 +161,7 @@ en temiz secenek).
   1. **Windows Güvenlik Duvarı.** İlk çalıştırmada Windows bir izin
      penceresi gösterebilir ("özel ağlar" ve "genel ağlar" ikisini de
      işaretle - okul ağı genelde "Genel" profilde sayılır ve varsayılan
-     olarak gelen bağlantıları engeller). Pencereyi kaçırdiysan: Windows
+     olarak gelen bağlantıları engeller). Pencereyi kaçırdıysan: Windows
      Güvenlik Duvarı ayarlarından `wfas_host.exe`'ye izin ver.
   2. ~~Eski sürümde: host, ilk bağlanan client'ın adresini kilitleyip başka
      hiçbir adresten gelen bağlantıyı kabul etmiyordu~~ — bu düzeltildi;
@@ -189,7 +189,7 @@ en temiz secenek).
 ## Linux
 
 Çoğu masaüstü dağıtımda `parec` zaten kurulu gelir (PulseAudio/PipeWire
-aracları). Yoksa: `sudo apt-get install pulseaudio-utils`
+araçları). Yoksa: `sudo apt-get install pulseaudio-utils`
 
 Tray ikonu için: `pip install pystray pillow` (opsiyonel, yoksa host
 otomatik konsol-only modda çalışır).
