@@ -5,12 +5,12 @@ on:
     branches: [main, master]
     paths:
       - "client/**"
-      - ".github/workflows/build-client-appimage.yml"
+      - ".github/workflows/appimage_build.yml"
     tags: ["v*"]
   workflow_dispatch:
 
 permissions:
-  contents: write   # tag push'ta release'e dosya yüklemek için
+  contents: read
 
 jobs:
   appimage:
@@ -43,8 +43,45 @@ jobs:
           path: client/appimage/dist/WFAS-Client-x86_64.AppImage
           if-no-files-found: error
 
-      - name: Release'e ekle (sadece v* tag)
-        if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    needs: appimage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # İki workflow (host + client) aynı release'i günceller; sıraya girsinler ki
+    # release'i aynı anda oluşturmaya çalışıp çakışmasınlar.
+    concurrency:
+      group: release-${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: WFAS-Client-x86_64.AppImage
+          path: assets
+
+      - name: Release etiketi
+        id: rel
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "name=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "pre=false" >> "$GITHUB_OUTPUT"
+          else
+            # Her main push'unda 'latest' etiketi son commit'e taşınır.
+            git tag -f latest "$GITHUB_SHA"
+            git push -f origin refs/tags/latest
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "name=Son derleme (main)" >> "$GITHUB_OUTPUT"
+            echo "pre=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Release'e yükle
         uses: softprops/action-gh-release@v2
         with:
-          files: client/appimage/dist/WFAS-Client-x86_64.AppImage
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: ${{ steps.rel.outputs.name }}
+          prerelease: ${{ steps.rel.outputs.pre }}
+          body: "Otomatik derleme - commit ${{ github.sha }}"
+          files: assets/*
