@@ -67,34 +67,35 @@ jobs:
       group: release-${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           name: wfas-host-windows
           path: assets
 
-      - name: Release etiketi
-        id: rel
+      - name: Release'e yükle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-            echo "name=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-            echo "pre=false" >> "$GITHUB_OUTPUT"
+            # v* etiketi: o sürüm için normal release
+            TAG="$GITHUB_REF_NAME"
+            gh release view "$TAG" >/dev/null 2>&1 || \
+              gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
           else
-            # Her main push'unda 'latest' etiketi son commit'e taşınır.
-            git tag -f latest "$GITHUB_SHA"
-            git push -f origin refs/tags/latest
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-            echo "name=Son derleme (main)" >> "$GITHUB_OUTPUT"
-            echo "pre=true" >> "$GITHUB_OUTPUT"
+            # main push'u: 'latest' pre-release'inin dosyalarını güncelle.
+            # Etiketi git ile taşımıyoruz: GITHUB_TOKEN, workflow dosyası içeren
+            # bir commit'e etiket oluşturamaz/taşıyamaz. Bu yüzden 'latest'
+            # release'i bir kez var olmalı; CI sadece dosyaların üstüne yazar.
+            TAG=latest
+            if ! gh release view "$TAG" >/dev/null 2>&1; then
+              gh release create "$TAG" --prerelease --target "$GITHUB_SHA" \
+                --title "Son derleme (main)" --notes "Otomatik derleme" || {
+                echo "::error::'latest' release'i otomatik oluşturulamadı. Repo > Releases > Draft a new release: etiket 'latest', 'Set as a pre-release' işaretli, yayınla. Sonra bu çalışmayı yeniden başlat."
+                exit 1
+              }
+            fi
+            gh release edit "$TAG" --prerelease \
+              --notes "Otomatik derleme - son commit $GITHUB_SHA ($(date -u +'%Y-%m-%d %H:%M UTC'))"
           fi
-
-      - name: Release'e yükle
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.rel.outputs.tag }}
-          name: ${{ steps.rel.outputs.name }}
-          prerelease: ${{ steps.rel.outputs.pre }}
-          body: "Otomatik derleme - commit ${{ github.sha }}"
-          files: assets/*
+          gh release upload "$TAG" assets/* --clobber
